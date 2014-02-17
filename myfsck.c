@@ -22,7 +22,7 @@
 # define lseek64 lseek
 #endif
 
-//#define DEBUG
+#define DEBUG
 #ifdef DEBUG
 # define dbg_print(...) printf(__VA_ARGS__)
 #else
@@ -36,16 +36,29 @@
 /* partition number starts at 1 */
 #define FIRST_PARTITION_NUM (1)
 
+/* size of bootstrap code area */
 #define BS_CODE_SIZE (446)
+
+/* number of primary partitions */
 #define PRI_PAR_NUM (4)
+
+/* byte offset of the superblock */
 #define SB_OFFSET (1024)
+
 #define SB_SIZE (sizeof(Superblock))
 #define GD_SIZE (sizeof(Groupdesc))
 #define INODE_SIZE (sizeof(Inode))
+
+/* byte size of a disk sector */
 #define SECTOR_SIZE_BYTES (512)
+
+/* disk sector offset of the superblock */
 #define SB_SECTOR_OFFSET (SB_OFFSET / SECTOR_SIZE_BYTES)
+
+/* disk sector length of the superblock */
 #define SB_SECTOR_LEN (SB_SIZE / SECTOR_SIZE_BYTES)
-#define BLOCK_SIZE_UNIT (1024)
+
+#define FS_BLOCK_SIZE_UNIT (1024)
 
 /* linux: lseek64 declaration needed here to eliminate compiler warning. */
 extern int64_t lseek64(int, int64_t, int);
@@ -54,8 +67,11 @@ static int device;  /* disk file descriptor */
 
 static const char *optstring = "p:i:f:";
 
-static int block_size = 1;
-static int sect_per_block = 1;
+static int block_size = 1024;
+static int sect_per_block = 2;
+static int ind_block_num = 256;
+static int d_ind_block_num = 65536;
+static int t_ind_block_num = 16777216;
 typedef struct partition Partition;
 typedef struct ext2_super_block Superblock;
 typedef struct ext2_group_desc Groupdesc;
@@ -64,6 +80,15 @@ typedef struct ext2_dir_entry_2 Directory;
 
 int get_target_partition(unsigned char *mbr, int target_id, unsigned int *sect);
 int get_target_partition_ext(unsigned int base_sect, unsigned int ext_sect, int *par_id, int target_id, unsigned int *sect);
+void get_fs_block_content(unsigned int par_start_sect, int block_id, unsigned char *content);
+void get_superblock(unsigned int par_start_sect, Superblock *sbp);
+void get_group_desc(unsigned int par_start_sect, int group_id, Groupdesc *gdp);
+void get_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode);
+void get_inode_block_content_indirect(unsigned int par_start_sect, unsigned int block_list_loc, int index, unsigned char *content);
+void get_inode_block_content_double_indirect(unsigned int par_start_sect, unsigned int dblock_list_loc, int index, unsigned char *content);
+void get_inode_block_content_triple_indirect(unsigned int par_start_sect, unsigned int tblock_list_loc, int index, unsigned char *content);
+void get_inode_block_content(unsigned int par_start_sect, Inode *inp, int index, unsigned char *content);
+void check_dir_pointers(Superblock *sbp, unsigned int par_start_sect, int start_inode, int parent_inode);
 
 /* print_sector: print the contents of a buffer containing one sector.
  *
@@ -130,6 +155,24 @@ void read_sectors (int64_t start_sector, unsigned int num_sectors, void *into)
     if ((ret = read(device, into, bytes_to_read)) != bytes_to_read) {
         fprintf(stderr, "Read sector %"PRId64" length %d failed: "
                 "returned %"PRId64"\n", start_sector, num_sectors, ret);
+        exit(-1);
+    }
+}
+
+void read_bytes(int64_t start_byte, unsigned int num_bytes, void *into)
+{
+    ssize_t ret;
+    int64_t lret;
+
+    if ((lret = lseek64(device, start_byte, SEEK_SET)) != start_byte) {
+        fprintf(stderr, "Seek to byte %"PRId64" failed: "
+                "returned %"PRId64"\n", start_byte, lret);
+        exit(-1);
+    }
+
+    if ((ret = read(device, into, num_bytes)) != num_bytes) {
+        fprintf(stderr, "Read byte %"PRId64" length %d failed: "
+                "returned %"PRId64"\n", start_byte, num_bytes, ret);
         exit(-1);
     }
 }
@@ -230,6 +273,7 @@ int main (int argc, char **argv)
     }
 
     unsigned int par_start_sect = 0;
+    unsigned int superblock[block_size];
     int found_par = 0;
     if (fix_partition) {
         par_num = FIRST_PARTITION_NUM;
@@ -237,6 +281,15 @@ int main (int argc, char **argv)
         while (found_par) {
             if ((par_fix == 0 || par_fix == par_num) && (par_start_sect != 0)) {
                 dbg_print("fixing partition %d starting at sector %d\n", par_num, par_start_sect);
+                get_superblock(par_start_sect, (Superblock *) superblock);
+                Superblock *sbp = (Superblock *) superblock;
+                dbg_print("superblock read with magic # %d\n", sbp->s_magic);
+                block_size = FS_BLOCK_SIZE_UNIT << sbp->s_log_block_size;
+                dbg_print("block size updated to %d\n", block_size);
+                sect_per_block = block_size / SECTOR_SIZE_BYTES;
+                dbg_print("sectors per block updated to %d\n", sect_per_block);
+                check_dir_pointers(sbp, par_start_sect, EXT2_ROOT_INO, EXT2_ROOT_INO);
+                // update indi, d_indi, t_indi
                 // fix this partition
             }
             par_num++;
@@ -313,58 +366,170 @@ int get_target_partition_ext(unsigned int base_sect, unsigned int ext_sect, int 
 
 
 
-void read_bytes(int64_t start_byte, unsigned int num_bytes, void *into)
-{
-    ssize_t ret;
-    int64_t lret;
 
-    if ((lret = lseek64(device, start_byte, SEEK_SET)) != start_byte) {
-        fprintf(stderr, "Seek to byte %"PRId64" failed: "
-                "returned %"PRId64"\n", start_byte, lret);
-        exit(-1);
+
+
+
+
+
+void check_dir_pointers(Superblock *sbp, unsigned int par_start_sect, int start_inode, int parent_inode)
+{
+    unsigned char inode[INODE_SIZE] = "";
+    int num_blocks = 0;
+
+    get_inode(sbp, par_start_sect, start_inode, (Inode *) inode);
+    Inode *inp = (Inode *) inode;
+    num_blocks = inp->i_blocks / (2 << sbp->s_log_block_size);
+
+    dbg_print("inode %d has %d data blocks\n", start_inode, num_blocks);
+
+    unsigned char block_content[block_size];
+    get_inode_block_content(par_start_sect, inp, 0, block_content);
+
+    Directory *entry = NULL;
+    entry = (Directory *) block_content;
+    int broken = 0;
+
+    if (entry->inode != start_inode) {
+        printf("[fixed] Entry \'.\' of inode %d has invalid inode #: %d\n", start_inode, entry->inode);
+        entry->inode = start_inode;
+        broken = 1;
     }
 
-    if ((ret = read(device, into, num_bytes)) != num_bytes) {
-        fprintf(stderr, "Read byte %"PRId64" length %d failed: "
-                "returned %"PRId64"\n", start_byte, num_bytes, ret);
-        exit(-1);
+    entry = (Directory *) (block_content + entry->rec_len);
+    if (entry->inode != parent_inode) {
+        printf("[fixed] Entry \'..\' of inode %d has invalid inode #: %d\n", start_inode, entry->inode);
+        entry->inode = parent_inode;
+        broken = 1;
+    }
+
+    if (broken) {
+        int sect_index = par_start_sect + inp->i_block[0] * sect_per_block;
+        write_sectors(sect_index, sect_per_block, block_content);
+    }
+
+    int i = 0;
+    int accu_size = 0;
+    for (i = 0; i < num_blocks; i++) {
+        get_inode_block_content(par_start_sect, inp, i, block_content);
+        accu_size = 0;
+        entry = (Directory *) block_content;
+        while (accu_size < block_size && entry->inode != 0) {
+            if (entry->file_type == EXT2_FT_DIR && entry->inode != start_inode && entry->inode != parent_inode) {
+                check_dir_pointers(sbp, par_start_sect, entry->inode, start_inode);
+            }
+            accu_size += entry->rec_len;
+            entry = (Directory *) (block_content + accu_size);
+        }
     }
 }
 
-void get_super_block(unsigned int par_start_sect, Superblock *sb)
+void get_inode_block_content(unsigned int par_start_sect, Inode *inp, int index, unsigned char *content)
 {
-    read_sectors(par_start_sect + SB_SECTOR_OFFSET, SB_SECTOR_LEN, (void *) sb);
+    dbg_print("reading %dth data block in the inode\n", index);
+    if (index < EXT2_NDIR_BLOCKS) {
+        get_fs_block_content(par_start_sect, inp->i_block[index], content);
+    } else if (index < EXT2_NDIR_BLOCKS + ind_block_num) {
+        index -= EXT2_NDIR_BLOCKS;
+        get_inode_block_content_indirect(par_start_sect, inp->i_block[EXT2_IND_BLOCK], index, content);
+    } else if (index < EXT2_NDIR_BLOCKS + ind_block_num + d_ind_block_num) {
+        index -= (EXT2_NDIR_BLOCKS + ind_block_num);
+        get_inode_block_content_double_indirect(par_start_sect, inp->i_block[EXT2_DIND_BLOCK], index, content);
+    } else {
+        index -= (EXT2_NDIR_BLOCKS + ind_block_num + d_ind_block_num);
+        get_inode_block_content_triple_indirect(par_start_sect, inp->i_block[EXT2_TIND_BLOCK], index, content);
+    }
 }
 
-void get_group_desc(unsigned int par_start_sect, int group_id, Groupdesc *gd)
+void get_inode_block_content_indirect(unsigned int par_start_sect, unsigned int block_list_loc, int index, unsigned char *content)
 {
+    dbg_print("reading %dth in the indirect blocks\n", index);
+    unsigned char block_list[block_size];
+    get_fs_block_content(par_start_sect, block_list_loc, block_list);
+    __u32 *datablocks = (__u32 *) block_list;
+    unsigned int block_id = datablocks[index];
+    get_fs_block_content(par_start_sect, block_id, content);
+}
+
+void get_inode_block_content_double_indirect(unsigned int par_start_sect, unsigned int dblock_list_loc, int index, unsigned char *content)
+{
+    dbg_print("reading %dth in the double indirect blocks\n", index);
+    unsigned char dblock_list[block_size];
+    get_fs_block_content(par_start_sect, dblock_list_loc, dblock_list);
+    __u32 *dblocks = (__u32 *) dblock_list;
+    int indirect_block_index = index / ind_block_num;
+    get_inode_block_content_indirect(par_start_sect, dblocks[indirect_block_index], index % ind_block_num, content);
+}
+
+void get_inode_block_content_triple_indirect(unsigned int par_start_sect, unsigned int tblock_list_loc, int index, unsigned char *content)
+{
+    dbg_print("reading %dth in the triple indirect blocks\n", index);
+    unsigned char tblock_list[block_size];
+    get_fs_block_content(par_start_sect, tblock_list_loc, tblock_list);
+    __u32 *tblocks = (__u32 *) tblock_list;
+    int dblock_index = index / d_ind_block_num;
+    get_inode_block_content_double_indirect(par_start_sect, tblocks[dblock_index], index % d_ind_block_num, content);
+}
+
+void get_fs_block_content(unsigned int par_start_sect, int block_id, unsigned char *content)
+{
+    dbg_print("reading fs block %d\n", block_id);
+    unsigned int block_start_sect = par_start_sect + block_id * sect_per_block;
+    read_sectors(block_start_sect, sect_per_block, (void *) content);
+}
+
+void get_superblock(unsigned int par_start_sect, Superblock *sbp)
+{
+    read_sectors(par_start_sect + SB_SECTOR_OFFSET, SB_SECTOR_LEN, (void *) sbp);
+}
+
+void get_group_desc(unsigned int par_start_sect, int group_id, Groupdesc *gdp)
+{
+    dbg_print("reading group descriptor %d\n", group_id);
+
     unsigned int gd_start_sect = par_start_sect + SB_SECTOR_OFFSET + SB_SECTOR_LEN;
     unsigned int gd_start_byte = gd_start_sect * SECTOR_SIZE_BYTES + group_id * GD_SIZE;
-    read_bytes(gd_start_byte, GD_SIZE, (void *) gd);
+
+    read_bytes(gd_start_byte, GD_SIZE, (void *) gdp);
 }
 
-
-
-void get_inode(unsigned int par_start_sect, int inode_id, Inode *inode)
+void get_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode)
 {
-    dbg_print("partition starts at %d\n", par_start_sect);
-    unsigned char super_block_buf[SB_SIZE] = "";
-    unsigned char group_desc_buf[GD_SIZE] = "";
-    get_super_block(par_start_sect, (Superblock *) super_block_buf);
-    Superblock *sbp = (Superblock *) super_block_buf;
-    dbg_print("superblock magic: %d\n", sbp->s_magic);
-    unsigned int group_id = (inode_id - 1) / sbp->s_inodes_per_group;
-    get_group_desc(par_start_sect, group_id, (Groupdesc *) group_desc_buf);
-    Groupdesc *gdp = (Groupdesc *) group_desc_buf;
-    dbg_print("group desc inode table: %d\n", gdp->bg_inode_table);
-    unsigned int inode_index = (inode_id - 1) % sbp->s_inodes_per_group;
-    unsigned int inode_start_byte = par_start_sect * SECTOR_SIZE_BYTES + gdp->bg_inode_table * block_size + inode_index * INODE_SIZE;
-    dbg_print("sector bytes: %d\n", par_start_sect * SECTOR_SIZE_BYTES);
-    dbg_print("block bytes: %d\n", gdp->bg_inode_table * block_size);
-    dbg_print("inode offset: %d\n", inode_index * INODE_SIZE);
+    dbg_print("reading inode %d\n", inode_id);
+
+    unsigned char group_desc[GD_SIZE] = "";
+    unsigned int group_id = 0;
+    unsigned int inode_index = 0;
+    unsigned int inode_start_byte = 0;
+
+    group_id = (inode_id - 1) / sbp->s_inodes_per_group;
+    get_group_desc(par_start_sect, group_id, (Groupdesc *) group_desc);
+    Groupdesc *gdp = (Groupdesc *) group_desc;
+
+    dbg_print("inode table starts at block %d\n", gdp->bg_inode_table);
+
+    inode_index = (inode_id - 1) % sbp->s_inodes_per_group;
+
+    dbg_print("inode index into the table is %d\n", inode_index);
+
+    inode_start_byte = par_start_sect * SECTOR_SIZE_BYTES + gdp->bg_inode_table * block_size + inode_index * INODE_SIZE;
+
     dbg_print("inode starts at byte %d\n", inode_start_byte);
+
     read_bytes(inode_start_byte, INODE_SIZE, (void *) inode);
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 void get_block_bitmap(unsigned int par_start_sect, unsigned int group_id, unsigned char *bitmap)
 {
