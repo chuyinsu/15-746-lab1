@@ -23,7 +23,7 @@
 # define lseek64 lseek
 #endif
 
-#define DEBUG
+//#define DEBUG
 #ifdef DEBUG
 # define dbg_print(...) printf(__VA_ARGS__)
 #else
@@ -85,7 +85,9 @@ void get_fs_block_content(unsigned int par_start_sect, int block_id, unsigned ch
 void set_fs_block_content(unsigned int par_start_sect, int block_id, unsigned char *content);
 void get_superblock(unsigned int par_start_sect, Superblock *sbp);
 void get_group_desc(unsigned int par_start_sect, int group_id, Groupdesc *gdp);
+unsigned int get_inode_start_byte(Superblock *sbp, unsigned int par_start_sect, int inode_id);
 void get_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode);
+void update_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode);
 void get_inode_block_content_indirect(unsigned int par_start_sect, unsigned int block_list_loc, int index, unsigned char *content, int *block_id);
 void get_inode_block_content_double_indirect(unsigned int par_start_sect, unsigned int dblock_list_loc, int index, unsigned char *content, int *block_id);
 void get_inode_block_content_triple_indirect(unsigned int par_start_sect, unsigned int tblock_list_loc, int index, unsigned char *content, int *block_id);
@@ -96,6 +98,7 @@ int inode_allocated(Superblock *sbp, unsigned int par_start_sect, int inode_id);
 int get_inode_id_in_dir(Superblock *sbp, int parent_inode, unsigned int par_start_sect, char *file_name);
 void add_file_to_dir(Superblock *sbp, unsigned int par_start_sect, int parent_inode, int child_inode);
 void check_unref_inodes(Superblock *sbp, unsigned int par_start_sect);
+void check_inode_links_count(Superblock *sbp, unsigned int par_start_sect);
 
 /* print_sector: print the contents of a buffer containing one sector.
  *
@@ -230,6 +233,24 @@ void write_sectors (int64_t start_sector, unsigned int num_sectors, void *from)
     }
 }
 
+void write_bytes (int64_t start_byte, unsigned int num_bytes, void *from)
+{
+    ssize_t ret;
+    int64_t lret;
+
+    if ((lret = lseek64(device, start_byte, SEEK_SET)) != start_byte) {
+        fprintf(stderr, "Seek to position %"PRId64" failed: "
+                "returned %"PRId64"\n", start_byte, lret);
+        exit(-1);
+    }
+
+    if ((ret = write(device, from, num_bytes)) != num_bytes) {
+        fprintf(stderr, "Write sector %"PRId64" length %d failed: "
+                "returned %"PRId64"\n", start_byte, num_bytes, ret);
+        exit(-1);
+    }
+}
+
 int main (int argc, char **argv)
 {
     int op = 0;
@@ -298,6 +319,7 @@ int main (int argc, char **argv)
                 // update ind, d_ind, t_ind
                 check_dir_pointers(sbp, par_start_sect, EXT2_ROOT_INO, EXT2_ROOT_INO, 1);
                 check_unref_inodes(sbp, par_start_sect);
+                check_inode_links_count(sbp, par_start_sect);
                 // fix this partition
             }
             par_num++;
@@ -319,7 +341,7 @@ int get_target_partition(unsigned char *mbr, int target_id, unsigned int *sect)
     if (target_id <= PRI_PAR_NUM) {
         pp = (Partition *) (mbr + BS_CODE_SIZE + (target_id - 1) * sizeof(Partition));
         if (sect != NULL) {
-            if (pp->sys_ind != DOS_EXTENDED_PARTITION && pp->sys_ind != LINUX_EXTENDED_PARTITION && pp->sys_ind != WIN98_EXTENDED_PARTITION) {
+            if (pp->sys_ind == LINUX_EXT2_PARTITION) {
                 *sect = pp->start_sect;
             } else {
                 *sect = 0;
@@ -354,7 +376,11 @@ int get_target_partition_ext(unsigned int base_sect, unsigned int ext_sect, int 
     (*par_id)++;
     if (*par_id == target_id) {
         if (sect != NULL) {
-            *sect = ext_sect + pp->start_sect;
+            if (pp->sys_ind == LINUX_EXT2_PARTITION) {
+                *sect = ext_sect + pp->start_sect;
+            } else {
+                *sect = 0;
+            }
         } else {
             printf("0x%02X %d %d\n", pp->sys_ind, ext_sect + pp->start_sect, pp->nr_sects);
         }
@@ -507,7 +533,7 @@ void get_group_desc(unsigned int par_start_sect, int group_id, Groupdesc *gdp)
     read_bytes(gd_start_byte, GD_SIZE, (void *) gdp);
 }
 
-void get_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode)
+unsigned int get_inode_start_byte(Superblock *sbp, unsigned int par_start_sect, int inode_id)
 {
     dbg_print("reading inode %d\n", inode_id);
 
@@ -530,7 +556,20 @@ void get_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode
 
     dbg_print("inode starts at byte %d\n", inode_start_byte);
 
+    return inode_start_byte;
+
+}
+
+void get_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode)
+{
+    unsigned int inode_start_byte = get_inode_start_byte(sbp, par_start_sect, inode_id);
     read_bytes(inode_start_byte, INODE_SIZE, (void *) inode);
+}
+
+void update_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode)
+{
+    unsigned int inode_start_byte = get_inode_start_byte(sbp, par_start_sect, inode_id);
+    write_bytes(inode_start_byte, INODE_SIZE, (void *) inode);
 }
 
 void get_links_count(Superblock *sbp, unsigned int par_start_sect, int start_inode, int parent_inode, int target_inode, int *count)
@@ -672,17 +711,39 @@ void add_file_to_dir(Superblock *sbp, unsigned int par_start_sect, int parent_in
                     prev_entry->rec_len = EXT2_DIR_REC_LEN(prev_entry->name_len);
                 }
                 set_fs_block_content(par_start_sect, block_id, block_content);
-
                 if (file_type == EXT2_FT_DIR) {
                     check_dir_pointers(sbp, par_start_sect, child_inode, parent_inode, 0);
                 }
-
-                // parent link count + 1
                 stop = 1;
             }
             accu_size += EXT2_DIR_REC_LEN(p_entry->name_len);
             prev_entry = p_entry;
             p_entry = (Directory *) (block_content + accu_size);
+        }
+    }
+}
+
+void check_inode_links_count(Superblock *sbp, unsigned int par_start_sect)
+{
+    int i = 0;
+    int actual_links_count = 0;
+    int inode_total_num = sbp->s_inodes_count;
+    Inode *inp = NULL;
+    unsigned char inode[INODE_SIZE] = "";
+    for (i = EXT2_ROOT_INO; i <= inode_total_num; i++) {
+        if (inode_allocated(sbp, par_start_sect, i)) {
+            dbg_print("inode %d is allocated\n", i);
+            get_inode(sbp, par_start_sect, i, (Inode *) inode);
+            inp = (Inode *) inode;
+            actual_links_count = 0;
+            get_links_count(sbp, par_start_sect, EXT2_ROOT_INO, EXT2_ROOT_INO, i, &actual_links_count);
+            dbg_print("actual links count of inode %d is %d\n", i, actual_links_count);
+            if (inp->i_links_count != actual_links_count) {
+                dbg_print("links count inside inode %d is %d\n", i, inp->i_links_count);
+                printf("[fixed] inode %d links count is %d, should be %d\n", i, inp->i_links_count, actual_links_count);
+                inp->i_links_count = actual_links_count;
+                update_inode(sbp, par_start_sect, i, inp);
+            }
         }
     }
 }
