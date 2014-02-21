@@ -61,6 +61,8 @@
 
 #define FS_BLOCK_SIZE_UNIT (1024)
 
+#define NUM_RESV_BLOCKS (4)
+
 /* linux: lseek64 declaration needed here to eliminate compiler warning. */
 extern int64_t lseek64(int, int64_t, int);
 
@@ -87,11 +89,11 @@ void get_superblock(unsigned int par_start_sect, Superblock *sbp);
 void get_group_desc(unsigned int par_start_sect, int group_id, Groupdesc *gdp);
 unsigned int get_inode_start_byte(Superblock *sbp, unsigned int par_start_sect, int inode_id);
 void get_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode);
-void update_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode);
-void get_inode_block_content_indirect(unsigned int par_start_sect, unsigned int block_list_loc, int index, unsigned char *content, int *block_id);
-void get_inode_block_content_double_indirect(unsigned int par_start_sect, unsigned int dblock_list_loc, int index, unsigned char *content, int *block_id);
-void get_inode_block_content_triple_indirect(unsigned int par_start_sect, unsigned int tblock_list_loc, int index, unsigned char *content, int *block_id);
-void get_inode_block_content(unsigned int par_start_sect, Inode *inp, int index, unsigned char *content, int *block_id);
+void set_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode);
+void get_inode_block_content_indirect(unsigned int par_start_sect, unsigned int block_list_loc, int index, unsigned char *content, int *block_id, unsigned char bitmap[][block_size], Superblock *sbp);
+void get_inode_block_content_double_indirect(unsigned int par_start_sect, unsigned int dblock_list_loc, int index, unsigned char *content, int *block_id, unsigned char bitmap[][block_size], Superblock *sbp);
+void get_inode_block_content_triple_indirect(unsigned int par_start_sect, unsigned int tblock_list_loc, int index, unsigned char *content, int *block_id, unsigned char bitmap[][block_size], Superblock *sbp);
+void get_inode_block_content(unsigned int par_start_sect, Inode *inp, int index, unsigned char *content, int *block_id, unsigned char bitmap[][block_size], Superblock *sbp);
 void check_dir_pointers(Superblock *sbp, unsigned int par_start_sect, int start_inode, int parent_inode, int print_info);
 void get_links_count(Superblock *sbp, unsigned int par_start_sect, int start_inode, int parent_inode, int target_inode, int *count);
 int inode_allocated(Superblock *sbp, unsigned int par_start_sect, int inode_id);
@@ -99,6 +101,12 @@ int get_inode_id_in_dir(Superblock *sbp, int parent_inode, unsigned int par_star
 void add_file_to_dir(Superblock *sbp, unsigned int par_start_sect, int parent_inode, int child_inode);
 void check_unref_inodes(Superblock *sbp, unsigned int par_start_sect);
 void check_inode_links_count(Superblock *sbp, unsigned int par_start_sect);
+void check_block_bitmap(Superblock *sbp, unsigned int par_start_sect);
+void build_block_bitmap(Superblock *sbp, unsigned int par_start_sect, int start_inode, int parent_inode, unsigned char bitmap[][block_size]);
+void get_block_bitmap(unsigned int par_start_sect, int group_id, unsigned char *bitmap);
+void pre_build_block_bitmap(Superblock *sbp, int group_num, unsigned char bitmap[][block_size]);
+void set_block_bitmap(unsigned int par_start_sect, int group_id, unsigned char *bitmap);
+void set_bitmap_position(Superblock *sbp, int block_id, unsigned char bitmap[][block_size]);
 
 /* print_sector: print the contents of a buffer containing one sector.
  *
@@ -308,7 +316,7 @@ int main (int argc, char **argv)
         found_par = get_target_partition(mbr, par_num, &par_start_sect);
         while (found_par) {
             if ((par_fix == 0 || par_fix == par_num) && (par_start_sect != 0)) {
-                dbg_print("fixing partition %d starting at sector %d\n", par_num, par_start_sect);
+                printf("fixing partition %d starting at sector %d\n", par_num, par_start_sect);
                 get_superblock(par_start_sect, (Superblock *) superblock);
                 Superblock *sbp = (Superblock *) superblock;
                 dbg_print("superblock read with magic # %d\n", sbp->s_magic);
@@ -320,6 +328,7 @@ int main (int argc, char **argv)
                 check_dir_pointers(sbp, par_start_sect, EXT2_ROOT_INO, EXT2_ROOT_INO, 1);
                 check_unref_inodes(sbp, par_start_sect);
                 check_inode_links_count(sbp, par_start_sect);
+                check_block_bitmap(sbp, par_start_sect);
                 // fix this partition
             }
             par_num++;
@@ -408,7 +417,7 @@ void check_dir_pointers(Superblock *sbp, unsigned int par_start_sect, int start_
     dbg_print("inode %d has %d data blocks\n", start_inode, num_blocks);
 
     unsigned char block_content[block_size];
-    get_inode_block_content(par_start_sect, inp, 0, block_content, NULL);
+    get_inode_block_content(par_start_sect, inp, 0, block_content, NULL, NULL, NULL);
 
     Directory *entry = NULL;
     entry = (Directory *) block_content;
@@ -439,7 +448,7 @@ void check_dir_pointers(Superblock *sbp, unsigned int par_start_sect, int start_
     int i = 0;
     int accu_size = 0;
     for (i = 0; i < num_blocks; i++) {
-        get_inode_block_content(par_start_sect, inp, i, block_content, NULL);
+        get_inode_block_content(par_start_sect, inp, i, block_content, NULL, NULL, NULL);
         accu_size = 0;
         entry = (Directory *) block_content;
         while (accu_size < block_size && entry->inode != 0) {
@@ -452,56 +461,64 @@ void check_dir_pointers(Superblock *sbp, unsigned int par_start_sect, int start_
     }
 }
 
-void get_inode_block_content(unsigned int par_start_sect, Inode *inp, int index, unsigned char *content, int *block_id)
+void get_inode_block_content(unsigned int par_start_sect, Inode *inp, int index, unsigned char *content, int *block_id, unsigned char bitmap[][block_size], Superblock *sbp)
 {
     dbg_print("reading %dth data block in the inode\n", index);
     if (index < EXT2_NDIR_BLOCKS) {
         if (block_id != NULL) {
             *block_id = inp->i_block[index];
         }
+        set_bitmap_position(sbp, inp->i_block[index], bitmap); 
         get_fs_block_content(par_start_sect, inp->i_block[index], content);
     } else if (index < EXT2_NDIR_BLOCKS + ind_block_num) {
+        dbg_print("!!! %d\n", index);
         index -= EXT2_NDIR_BLOCKS;
-        get_inode_block_content_indirect(par_start_sect, inp->i_block[EXT2_IND_BLOCK], index, content, block_id);
+        get_inode_block_content_indirect(par_start_sect, inp->i_block[EXT2_IND_BLOCK], index, content, block_id, bitmap, sbp);
     } else if (index < EXT2_NDIR_BLOCKS + ind_block_num + d_ind_block_num) {
         index -= (EXT2_NDIR_BLOCKS + ind_block_num);
-        get_inode_block_content_double_indirect(par_start_sect, inp->i_block[EXT2_DIND_BLOCK], index, content, block_id);
+        get_inode_block_content_double_indirect(par_start_sect, inp->i_block[EXT2_DIND_BLOCK], index, content, block_id, bitmap, sbp);
     } else {
         index -= (EXT2_NDIR_BLOCKS + ind_block_num + d_ind_block_num);
-        get_inode_block_content_triple_indirect(par_start_sect, inp->i_block[EXT2_TIND_BLOCK], index, content, block_id);
+        get_inode_block_content_triple_indirect(par_start_sect, inp->i_block[EXT2_TIND_BLOCK], index, content, block_id, bitmap, sbp);
     }
 }
 
-void get_inode_block_content_indirect(unsigned int par_start_sect, unsigned int block_list_loc, int index, unsigned char *content, int *block_id)
+void get_inode_block_content_indirect(unsigned int par_start_sect, unsigned int block_list_loc, int index, unsigned char *content, int *block_id, unsigned char bitmap[][block_size], Superblock *sbp)
 {
     dbg_print("reading %dth in the indirect blocks\n", index);
+    set_bitmap_position(sbp, block_list_loc, bitmap);
     unsigned char block_list[block_size];
     get_fs_block_content(par_start_sect, block_list_loc, block_list);
     __u32 *datablocks = (__u32 *) block_list;
     if (block_id != NULL) {
         *block_id = datablocks[index];
     }
+    dbg_print("right before bug index %d\n", index);
+    dbg_print("right before bug: %d\n", datablocks[index]);
+    set_bitmap_position(sbp, datablocks[index], bitmap);
     get_fs_block_content(par_start_sect, datablocks[index], content);
 }
 
-void get_inode_block_content_double_indirect(unsigned int par_start_sect, unsigned int dblock_list_loc, int index, unsigned char *content, int *block_id)
+void get_inode_block_content_double_indirect(unsigned int par_start_sect, unsigned int dblock_list_loc, int index, unsigned char *content, int *block_id, unsigned char bitmap[][block_size], Superblock *sbp)
 {
     dbg_print("reading %dth in the double indirect blocks\n", index);
+    set_bitmap_position(sbp, dblock_list_loc, bitmap);
     unsigned char dblock_list[block_size];
     get_fs_block_content(par_start_sect, dblock_list_loc, dblock_list);
     __u32 *dblocks = (__u32 *) dblock_list;
     int indirect_block_index = index / ind_block_num;
-    get_inode_block_content_indirect(par_start_sect, dblocks[indirect_block_index], index % ind_block_num, content, block_id);
+    get_inode_block_content_indirect(par_start_sect, dblocks[indirect_block_index], index % ind_block_num, content, block_id, bitmap, sbp);
 }
 
-void get_inode_block_content_triple_indirect(unsigned int par_start_sect, unsigned int tblock_list_loc, int index, unsigned char *content, int *block_id)
+void get_inode_block_content_triple_indirect(unsigned int par_start_sect, unsigned int tblock_list_loc, int index, unsigned char *content, int *block_id, unsigned char bitmap[][block_size], Superblock *sbp)
 {
     dbg_print("reading %dth in the triple indirect blocks\n", index);
+    set_bitmap_position(sbp, tblock_list_loc, bitmap);
     unsigned char tblock_list[block_size];
     get_fs_block_content(par_start_sect, tblock_list_loc, tblock_list);
     __u32 *tblocks = (__u32 *) tblock_list;
     int dblock_index = index / d_ind_block_num;
-    get_inode_block_content_double_indirect(par_start_sect, tblocks[dblock_index], index % d_ind_block_num, content, block_id);
+    get_inode_block_content_double_indirect(par_start_sect, tblocks[dblock_index], index % d_ind_block_num, content, block_id, bitmap, sbp);
 }
 
 void get_fs_block_content(unsigned int par_start_sect, int block_id, unsigned char *content)
@@ -566,7 +583,7 @@ void get_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode
     read_bytes(inode_start_byte, INODE_SIZE, (void *) inode);
 }
 
-void update_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode)
+void set_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode)
 {
     unsigned int inode_start_byte = get_inode_start_byte(sbp, par_start_sect, inode_id);
     write_bytes(inode_start_byte, INODE_SIZE, (void *) inode);
@@ -588,7 +605,7 @@ void get_links_count(Superblock *sbp, unsigned int par_start_sect, int start_ino
     unsigned char block_content[block_size];
     Directory *entry = NULL;
     for (i = 0; i < num_blocks; i++) {
-        get_inode_block_content(par_start_sect, inp, i, block_content, NULL);
+        get_inode_block_content(par_start_sect, inp, i, block_content, NULL, NULL, NULL);
         accu_size = 0;
         entry = (Directory *) block_content;
         while (accu_size < block_size && entry->inode != 0) {
@@ -629,7 +646,7 @@ int get_inode_id_in_dir(Superblock *sbp, int parent_inode, unsigned int par_star
     unsigned char block_content[block_size];
     Directory *entry = NULL;
     for (i = 0; i < num_blocks; i++) {
-        get_inode_block_content(par_start_sect, inp, i, block_content, NULL);
+        get_inode_block_content(par_start_sect, inp, i, block_content, NULL, NULL, NULL);
         accu_size = 0;
         entry = (Directory *) block_content;
         while (accu_size < block_size && entry->inode != 0) {
@@ -692,7 +709,7 @@ void add_file_to_dir(Superblock *sbp, unsigned int par_start_sect, int parent_in
     int block_id = 0;
     int stop = 0;
     for (i = 0; i < p_num_blocks && (!stop); i++) {
-        get_inode_block_content(par_start_sect, pinp, i, block_content, &block_id);
+        get_inode_block_content(par_start_sect, pinp, i, block_content, &block_id, NULL, NULL);
         accu_size = 0;
         prev_entry = NULL;
         p_entry = (Directory *) block_content;
@@ -742,7 +759,7 @@ void check_inode_links_count(Superblock *sbp, unsigned int par_start_sect)
                 dbg_print("links count inside inode %d is %d\n", i, inp->i_links_count);
                 printf("[fixed] inode %d links count is %d, should be %d\n", i, inp->i_links_count, actual_links_count);
                 inp->i_links_count = actual_links_count;
-                update_inode(sbp, par_start_sect, i, inp);
+                set_inode(sbp, par_start_sect, i, inp);
             }
         }
     }
@@ -775,18 +792,129 @@ void check_inode_links_count(Superblock *sbp, unsigned int par_start_sect)
 
 
 
+void build_block_bitmap(Superblock *sbp, unsigned int par_start_sect, int start_inode, int parent_inode, unsigned char bitmap[][block_size])
+{
+    unsigned char inode[INODE_SIZE] = "";
+    int num_blocks = 0;
 
+    get_inode(sbp, par_start_sect, start_inode, (Inode *) inode);
+    Inode *inp = (Inode *) inode;
+    num_blocks = inp->i_blocks / (2 << sbp->s_log_block_size);
 
+    dbg_print("inode %d has %d data blocks\n", start_inode, num_blocks);
 
+    int i = 0;
+    int accu_size = 0;
+    Directory *entry = NULL;
+    unsigned char block_content[block_size];
+    for (i = 0; i < num_blocks; i++) {
+        get_inode_block_content(par_start_sect, inp, i, block_content, NULL, bitmap, sbp);
+        if (S_ISDIR(inp->i_mode)) {
+            accu_size = 0;
+            entry = (Directory *) block_content;
+            while (accu_size < block_size && entry->inode != 0) {
+                if (entry->inode != start_inode && entry->inode != parent_inode) {
+                    build_block_bitmap(sbp, par_start_sect, entry->inode, start_inode, bitmap);
+                }
+                accu_size += entry->rec_len;
+                entry = (Directory *) (block_content + accu_size);
+            }
+        }
+    }
+}
 
+void pre_build_block_bitmap(Superblock *sbp, int group_num, unsigned char bitmap[][block_size])
+{
+    memset(bitmap, '\0', group_num * block_size);
+    int inode_table_blocks = sbp->s_inodes_per_group * INODE_SIZE / block_size;
+    if ((sbp->s_inodes_per_group * INODE_SIZE) % block_size) {
+        inode_table_blocks++;
+    }
+    dbg_print("num blocks of inode table: %d\n", inode_table_blocks);
+    dbg_print("total num of rsev blocks: %d\n", inode_table_blocks + NUM_RESV_BLOCKS);
+    int i = 0;
+    int j = 0;
+    for (i = 0; i < group_num; i++) {
+        for (j = 0; j < NUM_RESV_BLOCKS + inode_table_blocks; j++) {
+            if (i == group_num - 1 && (j == 2 || j == 3)) {
+                continue;
+            }
+            bitmap[i][j / CHAR_BIT] |= (1 << j % CHAR_BIT);
+        }
+    }
+    dbg_print("total num of blocks: %d\n", group_num * sbp->s_blocks_per_group);
+    dbg_print("actual total num of blocks: %d\n", sbp->s_blocks_count);
+    int redundant_block_num = group_num * sbp->s_blocks_per_group - sbp->s_blocks_count;
+    for (i = sbp->s_blocks_per_group - redundant_block_num - 1; i < sbp->s_blocks_per_group; i++) {
+        bitmap[group_num - 1][i / CHAR_BIT] |= (1 << i % CHAR_BIT);
+    }
+}
 
+void check_block_bitmap(Superblock *sbp, unsigned int par_start_sect)
+{
+    int group_num_1 = sbp->s_inodes_count / sbp->s_inodes_per_group;
+    if (sbp->s_inodes_count % sbp->s_inodes_per_group) {
+        group_num_1++;
+    }
+    dbg_print("total number of groups (from inode): %d\n", group_num_1);
+    int group_num_2 = sbp->s_blocks_count / sbp->s_blocks_per_group;
+    if (sbp->s_blocks_count % sbp->s_blocks_per_group) {
+        group_num_2++;
+    }
+    dbg_print("total number of groups (from block): %d\n", group_num_2);
+    int group_num = group_num_1;
 
-void get_inode_bitmap(unsigned int par_start_sect, int group_id, unsigned char *bitmap)
+    unsigned char total_bitmap[group_num][block_size];
+    pre_build_block_bitmap(sbp, group_num, total_bitmap);
+    build_block_bitmap(sbp, par_start_sect, EXT2_ROOT_INO, EXT2_ROOT_INO, total_bitmap);
+
+    unsigned char bitmap[block_size];
+    int block_total_num = sbp->s_blocks_count;
+    int i = 0;
+    int j = 0;
+    int same = 0;
+    for (i = 0; i < group_num; i++) {
+        get_block_bitmap(par_start_sect, i, bitmap);
+        same = 1;
+        for (j = 0; j < block_size; j++) {
+            if (total_bitmap[i][j] != bitmap[j]) {
+                dbg_print("group %d\n", i);
+                dbg_print("bitmap index %d\n", j);
+                dbg_print("total_bitmap: %d\n", total_bitmap[i][j]);
+                dbg_print("bitmap: %d\n", bitmap[j]);
+                printf("[fixed] block bitmap differences\n");
+                same = 0;
+            }
+        }
+        if (!same) {
+            set_block_bitmap(par_start_sect, i, total_bitmap[i]);
+        }
+    }
+}
+
+void get_block_bitmap(unsigned int par_start_sect, int group_id, unsigned char *bitmap)
 {
     unsigned char group_desc_buf[GD_SIZE] = "";
     get_group_desc(par_start_sect, group_id, (Groupdesc *) group_desc_buf);
     Groupdesc *gdp = (Groupdesc *) group_desc_buf;
-    read_sectors(par_start_sect + gdp->bg_inode_bitmap * sect_per_block, sect_per_block, bitmap);
+    read_sectors(par_start_sect + gdp->bg_block_bitmap * sect_per_block, sect_per_block, bitmap);
+}
+
+void set_block_bitmap(unsigned int par_start_sect, int group_id, unsigned char *bitmap)
+{
+    unsigned char group_desc_buf[GD_SIZE] = "";
+    get_group_desc(par_start_sect, group_id, (Groupdesc *) group_desc_buf);
+    Groupdesc *gdp = (Groupdesc *) group_desc_buf;
+    write_sectors(par_start_sect + gdp->bg_block_bitmap * sect_per_block, sect_per_block, bitmap);
+}
+
+void set_bitmap_position(Superblock *sbp, int block_id, unsigned char bitmap[][block_size])
+{
+    if (block_id != 0 && bitmap != NULL) {
+        int group_id = (block_id - 1) / sbp->s_blocks_per_group;
+        int block_index = (block_id - 1) % sbp->s_blocks_per_group;
+        bitmap[group_id][block_index / CHAR_BIT] |= (1 << (block_index % CHAR_BIT));
+    }
 }
 
 /* EOF */
