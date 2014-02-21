@@ -1,21 +1,19 @@
-/* $cmuPDL: readwrite.c,v 1.3 2010/02/27 11:38:39 rajas Exp $ */
-/* $cmuPDL: readwrite.c,v 1.4 2014/01/26 21:16:20 avjaltad Exp $ */
-/* readwrite.c
- *
- * Code to read and write sectors to a "disk" file.
- * This is a support file for the "fsck" storage systems laboratory.
- *
- * author: Yinsu Chu (yinsuc)
+/**
+ * @file myfsck.c
+ * @brief 15-746 Spring 2014 Project 1 - File System Check Utility
+ * @author Yinsu Chu (yinsuc)
  */
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>     /* for memcpy() */
+#include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <inttypes.h>
 #include <limits.h>
+
 #include "genhd.h"
 #include "ext2_fs.h"
 
@@ -23,12 +21,16 @@
 # define lseek64 lseek
 #endif
 
+/* a simple debugging utility,
+ * uncomment the next line to display debugging information */
 //#define DEBUG
 #ifdef DEBUG
 # define dbg_print(...) printf(__VA_ARGS__)
 #else
 # define dbg_print(...) 
 #endif
+
+/* constants */
 
 /* MBR starts at sector 0 with length of 1 sector */
 #define MBR_SECT_INDEX (0)
@@ -59,22 +61,28 @@
 /* disk sector length of the superblock */
 #define SB_SECTOR_LEN (SB_SIZE / SECTOR_SIZE_BYTES)
 
+/* basic unit of file system block size */
 #define FS_BLOCK_SIZE_UNIT (1024)
 
+/* number of reserved blocks in each group,
+ * (superblock, group descriptors, etc.) */
 #define NUM_RESV_BLOCKS (4)
 
 /* linux: lseek64 declaration needed here to eliminate compiler warning. */
 extern int64_t lseek64(int, int64_t, int);
 
-static int device;  /* disk file descriptor */
+static int device; /* disk file descriptor */
 
 static const char *optstring = "p:i:f:";
 
 static int block_size = 1024;
 static int sect_per_block = 2;
+
+/* capacity of indirect, double and triple indirect block lists */
 static int ind_block_num = 256;
 static int d_ind_block_num = 65536;
 static int t_ind_block_num = 16777216;
+
 typedef struct partition Partition;
 typedef struct ext2_super_block Superblock;
 typedef struct ext2_group_desc Groupdesc;
@@ -131,7 +139,6 @@ void print_sector (unsigned char *buf)
     }
 }
 
-
 /* read_sectors: read a specified number of sectors into a buffer.
  *
  * inputs:
@@ -177,6 +184,13 @@ void read_sectors (int64_t start_sector, unsigned int num_sectors, void *into)
     }
 }
 
+/**
+ * @brief Read bytes from the disk.
+ * @param start_byte From which byte to read.
+ * @param num_bytes How many bytes to read.
+ * @param into Where to put the bytes read.
+ * @return Void.
+ */
 void read_bytes(int64_t start_byte, unsigned int num_bytes, void *into)
 {
     ssize_t ret;
@@ -241,6 +255,13 @@ void write_sectors (int64_t start_sector, unsigned int num_sectors, void *from)
     }
 }
 
+/**
+ * @brief Write bytes from the disk.
+ * @param start_byte From which byte to write.
+ * @param num_bytes How many bytes to write.
+ * @param into The content to write.
+ * @return Void.
+ */
 void write_bytes (int64_t start_byte, unsigned int num_bytes, void *from)
 {
     ssize_t ret;
@@ -268,6 +289,7 @@ int main (int argc, char **argv)
     int fix_partition = 0;
     char *disk_path = NULL;
 
+    /* parse cmd arguments */
     while ((op = getopt(argc, argv, optstring)) != -1) {
         switch (op) {
             case 'p':
@@ -302,6 +324,7 @@ int main (int argc, char **argv)
 
     free(disk_path);
 
+    /* display partition info */
     if (display_partition) {
         if (!get_target_partition(mbr, par_num, NULL)) {
             printf("%d\n", -1);
@@ -311,6 +334,8 @@ int main (int argc, char **argv)
     unsigned int par_start_sect = 0;
     unsigned int superblock[block_size];
     int found_par = 0;
+
+    /* fix partitions */
     if (fix_partition) {
         par_num = FIRST_PARTITION_NUM;
         found_par = get_target_partition(mbr, par_num, &par_start_sect);
@@ -324,12 +349,10 @@ int main (int argc, char **argv)
                 dbg_print("block size updated to %d\n", block_size);
                 sect_per_block = block_size / SECTOR_SIZE_BYTES;
                 dbg_print("sectors per block updated to %d\n", sect_per_block);
-                // update ind, d_ind, t_ind
                 check_dir_pointers(sbp, par_start_sect, EXT2_ROOT_INO, EXT2_ROOT_INO, 1);
                 check_unref_inodes(sbp, par_start_sect);
                 check_inode_links_count(sbp, par_start_sect);
                 check_block_bitmap(sbp, par_start_sect);
-                // fix this partition
             }
             par_num++;
             found_par = get_target_partition(mbr, par_num, &par_start_sect);
@@ -340,6 +363,13 @@ int main (int argc, char **argv)
     return 0;
 }
 
+/**
+ * @brief Get partition info from its ID.
+ * @param mbr MBR info.
+ * @param target_id Which partition to get.
+ * @param sect Write the starting sector of the partition here.
+ * @return 1 on partition found, 0 on not found.
+ */
 int get_target_partition(unsigned char *mbr, int target_id, unsigned int *sect)
 {
     if (target_id <= 0) {
@@ -374,6 +404,15 @@ int get_target_partition(unsigned char *mbr, int target_id, unsigned int *sect)
     return 0;
 }
 
+/**
+ * @brief A helper function to traverse the extended partitions.
+ * @param base_sect The starting sector of the primary partition.
+ * @param ext_sect The starting sector of this extended partition.
+ * @param par_id Iterator of the partition ID.
+ * @param target_id The partition ID to look for.
+ * @param sect Write back the starting sector of the target partition.
+ * @return 1 on partition found, 0 on not found.
+ */
 int get_target_partition_ext(unsigned int base_sect, unsigned int ext_sect, int *par_id, int target_id, unsigned int *sect)
 {
     Partition *pp = NULL;
@@ -405,6 +444,15 @@ int get_target_partition_ext(unsigned int base_sect, unsigned int ext_sect, int 
     return 0;
 }
 
+/**
+ * @brief Pass 1.
+ * @param sbp Supberblock info.
+ * @param par_start_sect Starting sector of the partition.
+ * @param start_inode From which inode to check (typically EXT2_ROOT_INO)
+ * @param parent_inode Parent inode of the start_inode.
+ * @param print_info 1 on printing fix info, 0 on not.
+ * @return Void.
+ */
 void check_dir_pointers(Superblock *sbp, unsigned int par_start_sect, int start_inode, int parent_inode, int print_info)
 {
     unsigned char inode[INODE_SIZE] = "";
@@ -461,6 +509,17 @@ void check_dir_pointers(Superblock *sbp, unsigned int par_start_sect, int start_
     }
 }
 
+/**
+ * @brief Get the content of a data block of an inode, with some auxiliary functionalities.
+ * @param par_start_sect Starting sector of the partition.
+ * @param inp Inode info.
+ * @param index Which data block to get.
+ * @param content Write back the content here.
+ * @param block_id Write back the block ID here.
+ * @param bitmap If not NULL, set corresponding position in this bitmap (Useful in Pass 4).
+ * @param sbp Superblock info.
+ * @return Void.
+ */
 void get_inode_block_content(unsigned int par_start_sect, Inode *inp, int index, unsigned char *content, int *block_id, unsigned char bitmap[][block_size], Superblock *sbp)
 {
     dbg_print("reading %dth data block in the inode\n", index);
@@ -471,7 +530,6 @@ void get_inode_block_content(unsigned int par_start_sect, Inode *inp, int index,
         set_bitmap_position(sbp, inp->i_block[index], bitmap); 
         get_fs_block_content(par_start_sect, inp->i_block[index], content);
     } else if (index < EXT2_NDIR_BLOCKS + ind_block_num) {
-        dbg_print("!!! %d\n", index);
         index -= EXT2_NDIR_BLOCKS;
         get_inode_block_content_indirect(par_start_sect, inp->i_block[EXT2_IND_BLOCK], index, content, block_id, bitmap, sbp);
     } else if (index < EXT2_NDIR_BLOCKS + ind_block_num + d_ind_block_num) {
@@ -483,6 +541,9 @@ void get_inode_block_content(unsigned int par_start_sect, Inode *inp, int index,
     }
 }
 
+/**
+ * @brief Get the content of an indirect block
+ */
 void get_inode_block_content_indirect(unsigned int par_start_sect, unsigned int block_list_loc, int index, unsigned char *content, int *block_id, unsigned char bitmap[][block_size], Superblock *sbp)
 {
     dbg_print("reading %dth in the indirect blocks\n", index);
@@ -493,12 +554,13 @@ void get_inode_block_content_indirect(unsigned int par_start_sect, unsigned int 
     if (block_id != NULL) {
         *block_id = datablocks[index];
     }
-    dbg_print("right before bug index %d\n", index);
-    dbg_print("right before bug: %d\n", datablocks[index]);
     set_bitmap_position(sbp, datablocks[index], bitmap);
     get_fs_block_content(par_start_sect, datablocks[index], content);
 }
 
+/**
+ * @brief Get the content of a double indirect block.
+ */
 void get_inode_block_content_double_indirect(unsigned int par_start_sect, unsigned int dblock_list_loc, int index, unsigned char *content, int *block_id, unsigned char bitmap[][block_size], Superblock *sbp)
 {
     dbg_print("reading %dth in the double indirect blocks\n", index);
@@ -510,6 +572,9 @@ void get_inode_block_content_double_indirect(unsigned int par_start_sect, unsign
     get_inode_block_content_indirect(par_start_sect, dblocks[indirect_block_index], index % ind_block_num, content, block_id, bitmap, sbp);
 }
 
+/**
+ * @brief Get the content of a triple indirect block.
+ */
 void get_inode_block_content_triple_indirect(unsigned int par_start_sect, unsigned int tblock_list_loc, int index, unsigned char *content, int *block_id, unsigned char bitmap[][block_size], Superblock *sbp)
 {
     dbg_print("reading %dth in the triple indirect blocks\n", index);
@@ -521,6 +586,13 @@ void get_inode_block_content_triple_indirect(unsigned int par_start_sect, unsign
     get_inode_block_content_double_indirect(par_start_sect, tblocks[dblock_index], index % d_ind_block_num, content, block_id, bitmap, sbp);
 }
 
+/**
+ * @brief Get the content of a file system block (typically 1024KB size).
+ * @param par_start_sect Starting sector of the partition.
+ * @param block_id Which block to get.
+ * @param content Write back content here.
+ * @return Void.
+ */
 void get_fs_block_content(unsigned int par_start_sect, int block_id, unsigned char *content)
 {
     dbg_print("reading fs block %d\n", block_id);
@@ -528,6 +600,13 @@ void get_fs_block_content(unsigned int par_start_sect, int block_id, unsigned ch
     read_sectors(block_start_sect, sect_per_block, (void *) content);
 }
 
+/**
+ * @brief Write the content of a file system block (typically 1024KB size).
+ * @param par_start_sect Starting sector of the partition.
+ * @param block_id Which block to get.
+ * @param content What content to write.
+ * @return Void.
+ */
 void set_fs_block_content(unsigned int par_start_sect, int block_id, unsigned char *content)
 {
     dbg_print("writing fs block %d\n", block_id);
@@ -535,11 +614,17 @@ void set_fs_block_content(unsigned int par_start_sect, int block_id, unsigned ch
     write_sectors(block_start_sect, sect_per_block, (void *) content);
 }
 
+/**
+ * @brief Read the superblock.
+ */
 void get_superblock(unsigned int par_start_sect, Superblock *sbp)
 {
     read_sectors(par_start_sect + SB_SECTOR_OFFSET, SB_SECTOR_LEN, (void *) sbp);
 }
 
+/**
+ * @brief Read the group descriptor.
+ */
 void get_group_desc(unsigned int par_start_sect, int group_id, Groupdesc *gdp)
 {
     dbg_print("reading group descriptor %d\n", group_id);
@@ -550,6 +635,9 @@ void get_group_desc(unsigned int par_start_sect, int group_id, Groupdesc *gdp)
     read_bytes(gd_start_byte, GD_SIZE, (void *) gdp);
 }
 
+/**
+ * @brief Get the starting byte of an inode.
+ */
 unsigned int get_inode_start_byte(Superblock *sbp, unsigned int par_start_sect, int inode_id)
 {
     dbg_print("reading inode %d\n", inode_id);
@@ -577,18 +665,34 @@ unsigned int get_inode_start_byte(Superblock *sbp, unsigned int par_start_sect, 
 
 }
 
+/**
+ * @brief Get the content of an inode.
+ */
 void get_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode)
 {
     unsigned int inode_start_byte = get_inode_start_byte(sbp, par_start_sect, inode_id);
     read_bytes(inode_start_byte, INODE_SIZE, (void *) inode);
 }
 
+/**
+ * @brief Write the content of an inode.
+ */
 void set_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode *inode)
 {
     unsigned int inode_start_byte = get_inode_start_byte(sbp, par_start_sect, inode_id);
     write_bytes(inode_start_byte, INODE_SIZE, (void *) inode);
 }
 
+/**
+ * @brief Count the links count of a given inode.
+ * @param sbp Superblock info.
+ * @param par_start_sect Starting sector of the partition.
+ * @param start_inode From which inode to count (typically EXT2_ROOT_INO).
+ * @param parent_inode The parent inode of start_inode.
+ * @param target_inode The target inode ID to count.
+ * @param count Write back the count here.
+ * @return Void.
+ */
 void get_links_count(Superblock *sbp, unsigned int par_start_sect, int start_inode, int parent_inode, int target_inode, int *count)
 {
     unsigned char inode[INODE_SIZE] = "";
@@ -621,6 +725,9 @@ void get_links_count(Superblock *sbp, unsigned int par_start_sect, int start_ino
     }
 }
 
+/**
+ * @brief Check whether an inode has been allocated in the bitmap.
+ */
 int inode_allocated(Superblock *sbp, unsigned int par_start_sect, int inode_id)
 {
     int group_id = (inode_id - 1) / sbp->s_inodes_per_group;
@@ -635,6 +742,14 @@ int inode_allocated(Superblock *sbp, unsigned int par_start_sect, int inode_id)
     return bitmap[byte_offset] & (1 << bit_offset);
 }
 
+/**
+ * @brief Get an inode ID under a given directory. Do not check recursively on subdirectories.
+ * @param sbp Superblock info.
+ * @param parent_inode The directory's inode ID.
+ * @param par_start_sect The starting sector of the partition.
+ * @param file_name String representation of the target inode's file name.
+ * @return 1 on found, 0 on not.
+ */
 int get_inode_id_in_dir(Superblock *sbp, int parent_inode, unsigned int par_start_sect, char *file_name)
 {
     unsigned char inode[INODE_SIZE] = "";
@@ -660,6 +775,9 @@ int get_inode_id_in_dir(Superblock *sbp, int parent_inode, unsigned int par_star
     return -1;
 }
 
+/**
+ * @brief Pass 2.
+ */
 void check_unref_inodes(Superblock *sbp, unsigned int par_start_sect)
 {
     int i = 0;
@@ -686,6 +804,14 @@ void check_unref_inodes(Superblock *sbp, unsigned int par_start_sect)
     }
 }
 
+/**
+ * @brief Add a file to a directory. Used to put inodes into lost+found.
+ * @param sbp Superblock info.
+ * @param par_start_sect Starting sector of the partition.
+ * @param parent_inode Under which directory to put the file.
+ * @param child_inode The inode of the file to put.
+ * @return Void.
+ */
 void add_file_to_dir(Superblock *sbp, unsigned int par_start_sect, int parent_inode, int child_inode)
 {
     dbg_print("adding inode %d as a child of inode %d\n", child_inode, parent_inode);
@@ -740,6 +866,9 @@ void add_file_to_dir(Superblock *sbp, unsigned int par_start_sect, int parent_in
     }
 }
 
+/**
+ * @brief Pass 3.
+ */
 void check_inode_links_count(Superblock *sbp, unsigned int par_start_sect)
 {
     int i = 0;
@@ -765,33 +894,9 @@ void check_inode_links_count(Superblock *sbp, unsigned int par_start_sect)
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+/**
+ * @brief Traverse the directory tree to build a block bitmap.
+ */
 void build_block_bitmap(Superblock *sbp, unsigned int par_start_sect, int start_inode, int parent_inode, unsigned char bitmap[][block_size])
 {
     unsigned char inode[INODE_SIZE] = "";
@@ -823,6 +928,13 @@ void build_block_bitmap(Superblock *sbp, unsigned int par_start_sect, int start_
     }
 }
 
+/**
+ * @brief Set the reserved positions in a block bitmap, such as superblock, group descriptors, etc.
+ * @param sbp Superblock inf.
+ * @param group_num The total number of block groups.
+ * @param bitmap A 2D array, first index is group ID, second is the bitmap of that group.
+ * @return Void.
+ */
 void pre_build_block_bitmap(Superblock *sbp, int group_num, unsigned char bitmap[][block_size])
 {
     memset(bitmap, '\0', group_num * block_size);
@@ -842,14 +954,17 @@ void pre_build_block_bitmap(Superblock *sbp, int group_num, unsigned char bitmap
             bitmap[i][j / CHAR_BIT] |= (1 << j % CHAR_BIT);
         }
     }
-    dbg_print("total num of blocks: %d\n", group_num * sbp->s_blocks_per_group);
-    dbg_print("actual total num of blocks: %d\n", sbp->s_blocks_count);
+
+    /* add paddings to redundant blocks */
     int redundant_block_num = group_num * sbp->s_blocks_per_group - sbp->s_blocks_count;
     for (i = sbp->s_blocks_per_group - redundant_block_num - 1; i < sbp->s_blocks_per_group; i++) {
         bitmap[group_num - 1][i / CHAR_BIT] |= (1 << i % CHAR_BIT);
     }
 }
 
+/**
+ * @brief Pass 4.
+ */
 void check_block_bitmap(Superblock *sbp, unsigned int par_start_sect)
 {
     int group_num_1 = sbp->s_inodes_count / sbp->s_inodes_per_group;
@@ -878,12 +993,9 @@ void check_block_bitmap(Superblock *sbp, unsigned int par_start_sect)
         same = 1;
         for (j = 0; j < block_size; j++) {
             if (total_bitmap[i][j] != bitmap[j]) {
-                dbg_print("group %d\n", i);
-                dbg_print("bitmap index %d\n", j);
-                dbg_print("total_bitmap: %d\n", total_bitmap[i][j]);
-                dbg_print("bitmap: %d\n", bitmap[j]);
                 printf("[fixed] block bitmap differences\n");
                 same = 0;
+                break;
             }
         }
         if (!same) {
@@ -892,6 +1004,9 @@ void check_block_bitmap(Superblock *sbp, unsigned int par_start_sect)
     }
 }
 
+/**
+ * @brief Get the block bitmap.
+ */
 void get_block_bitmap(unsigned int par_start_sect, int group_id, unsigned char *bitmap)
 {
     unsigned char group_desc_buf[GD_SIZE] = "";
@@ -900,6 +1015,9 @@ void get_block_bitmap(unsigned int par_start_sect, int group_id, unsigned char *
     read_sectors(par_start_sect + gdp->bg_block_bitmap * sect_per_block, sect_per_block, bitmap);
 }
 
+/**
+ * @brief Write the block bitmap.
+ */
 void set_block_bitmap(unsigned int par_start_sect, int group_id, unsigned char *bitmap)
 {
     unsigned char group_desc_buf[GD_SIZE] = "";
@@ -908,6 +1026,9 @@ void set_block_bitmap(unsigned int par_start_sect, int group_id, unsigned char *
     write_sectors(par_start_sect + gdp->bg_block_bitmap * sect_per_block, sect_per_block, bitmap);
 }
 
+/**
+ * @brief Set a specific position in the block bitmap.
+ */
 void set_bitmap_position(Superblock *sbp, int block_id, unsigned char bitmap[][block_size])
 {
     if (block_id != 0 && bitmap != NULL) {
