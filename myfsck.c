@@ -48,6 +48,7 @@
 /* byte offset of the superblock */
 #define SB_OFFSET (1024)
 
+/* size of various structures */
 #define SB_SIZE (sizeof(Superblock))
 #define GD_SIZE (sizeof(Groupdesc))
 #define INODE_SIZE (sizeof(Inode))
@@ -73,6 +74,7 @@ extern int64_t lseek64(int, int64_t, int);
 
 static int device; /* disk file descriptor */
 
+/* for cmd arguments parsing */
 static const char *optstring = "p:i:f:";
 
 static int block_size = 1024;
@@ -185,7 +187,7 @@ void read_sectors (int64_t start_sector, unsigned int num_sectors, void *into)
 }
 
 /**
- * @brief Read bytes from the disk.
+ * @brief Read bytes from the disk, modified from read_sectors().
  * @param start_byte From which byte to read.
  * @param num_bytes How many bytes to read.
  * @param into Where to put the bytes read.
@@ -256,7 +258,7 @@ void write_sectors (int64_t start_sector, unsigned int num_sectors, void *from)
 }
 
 /**
- * @brief Write bytes from the disk.
+ * @brief Write bytes to the disk, modified from write_sectors().
  * @param start_byte From which byte to write.
  * @param num_bytes How many bytes to write.
  * @param into The content to write.
@@ -337,9 +339,12 @@ int main (int argc, char **argv)
 
     /* fix partitions */
     if (fix_partition) {
+        /* search valid partitions one by one */
         par_num = FIRST_PARTITION_NUM;
         found_par = get_target_partition(mbr, par_num, &par_start_sect);
         while (found_par) {
+            /* partitions not suitable to fix are identified by par_start_sect == 0,
+             * e.g. non-ext2 partitions, primary extended partition... */
             if ((par_fix == 0 || par_fix == par_num) && (par_start_sect != 0)) {
                 printf("fixing partition %d starting at sector %d\n", par_num, par_start_sect);
                 get_superblock(par_start_sect, (Superblock *) superblock);
@@ -349,10 +354,13 @@ int main (int argc, char **argv)
                 dbg_print("block size updated to %d\n", block_size);
                 sect_per_block = block_size / SECTOR_SIZE_BYTES;
                 dbg_print("sectors per block updated to %d\n", sect_per_block);
+
+                /* pass 1 to 4 */
                 check_dir_pointers(sbp, par_start_sect, EXT2_ROOT_INO, EXT2_ROOT_INO, 1);
                 check_unref_inodes(sbp, par_start_sect);
                 check_inode_links_count(sbp, par_start_sect);
                 check_block_bitmap(sbp, par_start_sect);
+
             }
             par_num++;
             found_par = get_target_partition(mbr, par_num, &par_start_sect);
@@ -376,6 +384,7 @@ int get_target_partition(unsigned char *mbr, int target_id, unsigned int *sect)
         return 0;
     }
 
+    /* primay non-extended partitions */
     Partition *pp = NULL;
     if (target_id <= PRI_PAR_NUM) {
         pp = (Partition *) (mbr + BS_CODE_SIZE + (target_id - 1) * sizeof(Partition));
@@ -391,6 +400,7 @@ int get_target_partition(unsigned char *mbr, int target_id, unsigned int *sect)
         return 1;
     }
 
+    /* extended partitions */
     int i = 0;
     int par_id = 4;
     for (i = 0; i < PRI_PAR_NUM; i++) {
@@ -467,6 +477,7 @@ void check_dir_pointers(Superblock *sbp, unsigned int par_start_sect, int start_
     unsigned char block_content[block_size];
     get_inode_block_content(par_start_sect, inp, 0, block_content, NULL, NULL, NULL);
 
+    /* check the . and .. entries */
     Directory *entry = NULL;
     entry = (Directory *) block_content;
     int broken = 0;
@@ -493,6 +504,7 @@ void check_dir_pointers(Superblock *sbp, unsigned int par_start_sect, int start_
         write_sectors(sect_index, sect_per_block, block_content);
     }
 
+    /* continue traversing the dir tree */
     int i = 0;
     int accu_size = 0;
     for (i = 0; i < num_blocks; i++) {
@@ -587,7 +599,7 @@ void get_inode_block_content_triple_indirect(unsigned int par_start_sect, unsign
 }
 
 /**
- * @brief Get the content of a file system block (typically 1024KB size).
+ * @brief Get the content of a file system block (typically 1024B size).
  * @param par_start_sect Starting sector of the partition.
  * @param block_id Which block to get.
  * @param content Write back content here.
@@ -601,7 +613,7 @@ void get_fs_block_content(unsigned int par_start_sect, int block_id, unsigned ch
 }
 
 /**
- * @brief Write the content of a file system block (typically 1024KB size).
+ * @brief Write the content of a file system block (typically 1024B size).
  * @param par_start_sect Starting sector of the partition.
  * @param block_id Which block to get.
  * @param content What content to write.
@@ -662,7 +674,6 @@ unsigned int get_inode_start_byte(Superblock *sbp, unsigned int par_start_sect, 
     dbg_print("inode starts at byte %d\n", inode_start_byte);
 
     return inode_start_byte;
-
 }
 
 /**
@@ -684,7 +695,7 @@ void set_inode(Superblock *sbp, unsigned int par_start_sect, int inode_id, Inode
 }
 
 /**
- * @brief Count the links count of a given inode.
+ * @brief Count the links count of a given target inode.
  * @param sbp Superblock info.
  * @param par_start_sect Starting sector of the partition.
  * @param start_inode From which inode to count (typically EXT2_ROOT_INO).
@@ -730,12 +741,15 @@ void get_links_count(Superblock *sbp, unsigned int par_start_sect, int start_ino
  */
 int inode_allocated(Superblock *sbp, unsigned int par_start_sect, int inode_id)
 {
+    /* get the bitmap */
     int group_id = (inode_id - 1) / sbp->s_inodes_per_group;
     unsigned char group_desc_buf[GD_SIZE] = "";
     get_group_desc(par_start_sect, group_id, (Groupdesc *) group_desc_buf);
     Groupdesc *gdp = (Groupdesc *) group_desc_buf;
     unsigned char bitmap[block_size];
     read_sectors(par_start_sect + gdp->bg_inode_bitmap * sect_per_block, sect_per_block, bitmap);
+
+    /* check the bitmap */
     int inode_index = (inode_id - 1) % sbp->s_inodes_per_group;
     int byte_offset = inode_index / CHAR_BIT;
     int bit_offset = inode_index % CHAR_BIT;
@@ -805,7 +819,9 @@ void check_unref_inodes(Superblock *sbp, unsigned int par_start_sect)
 }
 
 /**
- * @brief Add a file to a directory. Used to put inodes into lost+found.
+ * @brief Add a file to a directory. Used to put inodes into /lost+found.
+ *        Assumption: no need to allocate additional data blocks (i.e.
+ *        there is enough space under the directory).
  * @param sbp Superblock info.
  * @param par_start_sect Starting sector of the partition.
  * @param parent_inode Under which directory to put the file.
@@ -841,6 +857,7 @@ void add_file_to_dir(Superblock *sbp, unsigned int par_start_sect, int parent_in
         p_entry = (Directory *) block_content;
         while (accu_size < block_size && (!stop)) {
             if (p_entry->inode == 0) {
+                /* an empty entry is found */
                 p_entry->inode = child_inode;
                 if (prev_entry != NULL) {
                     p_entry->rec_len = prev_entry->rec_len - EXT2_DIR_REC_LEN(prev_entry->name_len);
@@ -855,10 +872,13 @@ void add_file_to_dir(Superblock *sbp, unsigned int par_start_sect, int parent_in
                 }
                 set_fs_block_content(par_start_sect, block_id, block_content);
                 if (file_type == EXT2_FT_DIR) {
+                    /* need to repeat pass 1 to fix . and ..,
+                     * just no need to print out error info */
                     check_dir_pointers(sbp, par_start_sect, child_inode, parent_inode, 0);
                 }
                 stop = 1;
             }
+            /* advance the size according to the actual size instead of rec_len */
             accu_size += EXT2_DIR_REC_LEN(p_entry->name_len);
             prev_entry = p_entry;
             p_entry = (Directory *) (block_content + accu_size);
@@ -949,6 +969,9 @@ void pre_build_block_bitmap(Superblock *sbp, int group_num, unsigned char bitmap
     for (i = 0; i < group_num; i++) {
         for (j = 0; j < NUM_RESV_BLOCKS + inode_table_blocks; j++) {
             if (i == group_num - 1 && (j == 2 || j == 3)) {
+                /* superblocks only exist in groups with ID 0, 1 and powers of 3, 5, 7,
+                 * a simplified approach here: assume there are at most three block groups,
+                 * which is the case in all the test cases (including those on Autolab*. */
                 continue;
             }
             bitmap[i][j / CHAR_BIT] |= (1 << j % CHAR_BIT);
